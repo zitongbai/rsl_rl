@@ -46,7 +46,7 @@ include = ["rsl_rl*"]
 
 [tool.isort]
 
-py_version = 37
+py_version = 310
 line_length = 120
 group_by_package = true
 
@@ -78,8 +78,8 @@ known_first_party = "rsl_rl"
 
 include = ["rsl_rl"]
 
-typeCheckingMode = "basic"
-pythonVersion = "3.7"
+typeCheckingMode = "off"
+pythonVersion = "3.10"
 pythonPlatform = "Linux"
 enableTypeIgnoreComments = true
 

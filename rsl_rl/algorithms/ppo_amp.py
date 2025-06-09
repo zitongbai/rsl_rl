@@ -14,17 +14,14 @@ from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.modules.amp_discriminator import AMPDiscriminator
 
 
-class AMP_PPO(PPO):
+class PPOAmp(PPO):
     
     policy: ActorCritic
     """The actor critic module."""
-    discriminator: AMPDiscriminator
     
     def __init__(
         self,
         policy,
-        discriminator,
-        motion_loader, 
         num_learning_epochs=1,
         num_mini_batches=1,
         clip_param=0.2,
@@ -73,34 +70,41 @@ class AMP_PPO(PPO):
         self.amp_cfg = amp_cfg
         
         # AMP Discriminator
-        self.discriminator = discriminator
-        self.discriminator.to(device)
-        
-        # optimizer for policy and discriminator
-        params = [
-            {
-                "name": "actor_critic", 
-                "params": self.policy.parameters(),
-            }, 
-            {
-                "name": "amp_trunk", 
-                "params": self.discriminator.trunk.parameters(),
-                "weight_decay": 1e-4,  # L2 regularization for the discriminator trunk
-            },
-            {
-                "name": "amp_linear",
-                "params": self.discriminator.amp_linear.parameters(),
-                "weight_decay": 1e-2,  # L2 regularization for the discriminator linear layer
-            }
-        ]
-        self.optimizer = optim.Adam(params, lr=learning_rate)
+        if self.amp_cfg is not None:
+            self.amp_discriminator = AMPDiscriminator(
+                input_dim=self.amp_cfg["num_amp_obs"],
+                **self.amp_cfg["amp_discriminator"]
+            ).to(self.device)
+            
+            # optimizer for policy and discriminator
+            params = [
+                {
+                    "name": "actor_critic", 
+                    "params": self.policy.parameters(),
+                }, 
+                {
+                    "name": "amp_trunk", 
+                    "params": self.amp_discriminator.trunk.parameters(),
+                    "weight_decay": self.amp_cfg["amp_trunk_weight_decay"],  # L2 regularization for the discriminator trunk
+                },
+                {
+                    "name": "amp_linear",
+                    "params": self.amp_discriminator.amp_linear.parameters(),
+                    "weight_decay": self.amp_cfg["amp_linear_weight_decay"],  # L2 regularization for the discriminator linear layer
+                }
+            ]
+            # change the optimizer when AMP is used
+            self.optimizer = optim.Adam(params, lr=learning_rate)
 
-        # Storage
-        self.amp_replay_buffer: CircularBuffer = None   # type: ignore
-        
-        # Motion loader
-        self.motion_loader = motion_loader
-        
+            # Storage
+            self.amp_replay_buffer: CircularBuffer = None   # type: ignore
+            
+            # Motion loader
+            self.motion_loader = self.amp_cfg["_motion_loader"]
+            
+        else:
+            self.amp_discriminator = None
+
         
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
@@ -115,17 +119,25 @@ class AMP_PPO(PPO):
         )
         
         # Initialize the AMP replay buffer
-        self.amp_replay_buffer = CircularBuffer(
-            max_len=self.amp_cfg["replay_buffer_size"], # TODO
-            batch_size=num_envs,
-            device=self.device
-        )
+        if self.amp_cfg is not None:
+            self.amp_replay_buffer = CircularBuffer(
+                max_len=self.amp_cfg["replay_buffer_size"],
+                batch_size=num_envs,
+                device=self.device
+            )
     
     def process_env_step(self, rewards, dones, infos, amp_obs):
         
-        super().process_env_step(rewards, dones, infos)
-        self.amp_replay_buffer.append(amp_obs)
+        if self.amp_discriminator:
+            sum_rewards, disc_output, task_rewards, amp_rewards = self.amp_discriminator.predict_amp_reward(amp_obs, rewards)
+            self.amp_replay_buffer.append(amp_obs)
+            self.sum_rewards: torch.Tensor = sum_rewards  # for logging
+            self.disc_outputs: torch.Tensor = disc_output  # for logging
+            self.task_rewards: torch.Tensor = task_rewards  # for logging
+            self.amp_rewards: torch.Tensor = amp_rewards  # for logging
         
+        super().process_env_step(sum_rewards, dones, infos)
+
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
@@ -140,10 +152,11 @@ class AMP_PPO(PPO):
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
-        mean_amp_loss = 0
-        mean_grad_penalty_loss = 0
-        mean_policy_disc = 0
-        mean_expert_disc = 0
+        if self.amp_discriminator:
+            mean_amp_loss = 0
+            mean_grad_penalty_loss = 0
+            mean_policy_disc = 0
+            mean_expert_disc = 0
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -285,27 +298,22 @@ class AMP_PPO(PPO):
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Discriminator loss
-            policy_disc = self.discriminator(amp_replay_batch)
-            expert_disc = self.discriminator(motion_data_batch)
-            policy_loss = torch.nn.MSELoss()(
-                policy_disc, -1 * torch.ones_like(policy_disc, device=self.device)
-            )
-            expert_loss = torch.nn.MSELoss()(
-                expert_disc, torch.ones_like(expert_disc, device=self.device)
-            )
-            amp_loss = 0.5 * (policy_loss + expert_loss)
-            grad_penalty_loss = self.discriminator.compute_grad_pen(
-                motion_data_batch, scale=self.amp_cfg["grad_penalty_scale"] # TODO
-            )
-            
-            loss = (
-                surrogate_loss 
-                + self.value_loss_coef * value_loss 
-                - self.entropy_coef * entropy_batch.mean()
-                + amp_loss
-                + grad_penalty_loss
-            )
-
+            if self.amp_discriminator:
+                policy_disc = self.amp_discriminator(amp_replay_batch)
+                expert_disc = self.amp_discriminator(motion_data_batch)
+                policy_loss = torch.nn.MSELoss()(
+                    policy_disc, -1 * torch.ones_like(policy_disc, device=self.device)
+                )
+                expert_loss = torch.nn.MSELoss()(
+                    expert_disc, torch.ones_like(expert_disc, device=self.device)
+                )
+                amp_loss = 0.5 * (policy_loss + expert_loss)
+                grad_penalty_loss = self.amp_discriminator.compute_grad_pen(
+                    motion_data_batch, scale=self.amp_cfg["grad_penalty_scale"]
+                )
+                
+                loss += amp_loss + grad_penalty_loss
+                
             # Symmetry loss
             if self.symmetry:
                 # obtain the symmetric actions
@@ -382,10 +390,11 @@ class AMP_PPO(PPO):
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
             # -- AMP losses
-            mean_amp_loss += amp_loss.item()
-            mean_grad_penalty_loss += grad_penalty_loss.item()
-            mean_policy_disc += policy_disc.mean().item()
-            mean_expert_disc += expert_disc.mean().item()
+            if mean_amp_loss is not None:
+                mean_amp_loss += amp_loss.item()
+                mean_grad_penalty_loss += grad_penalty_loss.item()
+                mean_policy_disc += policy_disc.mean().item()
+                mean_expert_disc += expert_disc.mean().item()
             
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -399,10 +408,11 @@ class AMP_PPO(PPO):
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
         # -- For AMP
-        mean_amp_loss /= num_updates
-        mean_grad_penalty_loss /= num_updates
-        mean_policy_disc /= num_updates
-        mean_expert_disc /= num_updates    
+        if mean_amp_loss is not None:
+            mean_amp_loss /= num_updates
+            mean_grad_penalty_loss /= num_updates
+            mean_policy_disc /= num_updates
+            mean_expert_disc /= num_updates    
         # -- Clear the storage
         self.storage.clear()
 
@@ -411,14 +421,15 @@ class AMP_PPO(PPO):
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "amp_loss": mean_amp_loss,
-            "grad_penalty_loss": mean_grad_penalty_loss,
-            "policy_disc": mean_policy_disc,
-            "expert_disc": mean_expert_disc,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-
+        if self.amp_discriminator:
+            loss_dict["amp_loss"] = mean_amp_loss
+            loss_dict["grad_penalty_loss"] = mean_grad_penalty_loss
+            loss_dict["policy_disc"] = mean_policy_disc
+            loss_dict["expert_disc"] = mean_expert_disc
+            
         return loss_dict

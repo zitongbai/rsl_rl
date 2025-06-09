@@ -69,7 +69,7 @@ class AMPDiscriminator(nn.Module):
         Returns:
             torch.Tensor: Scaled gradient penalty.
         """
-
+        expert_data.requires_grad_(True)
         disc = self.forward(expert_data)
         ones = torch.ones_like(disc, device=expert_data.device)
         grad = autograd.grad(
@@ -87,9 +87,6 @@ class AMPDiscriminator(nn.Module):
         Args:
             data (torch.Tensor): Input data tensor.
             task_reward (torch.Tensor): Task reward tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The predicted AMP reward and discriminator output.
         """
         with torch.no_grad():
             self.eval()
@@ -97,7 +94,7 @@ class AMPDiscriminator(nn.Module):
             amp_reward = self.amp_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc - 1), min=0)
             reward = self._lerp_reward(amp_reward, task_reward.unsqueeze(-1))
             self.train()
-        return reward.squeeze(), disc
+        return reward.squeeze(), disc.squeeze(), task_reward.squeeze(), amp_reward.squeeze()
 
     def _lerp_reward(self, amp_rew: torch.Tensor, task_rew: torch.Tensor):
         """Linearly interpolate between the AMP reward and the task reward."""

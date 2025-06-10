@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # ref: https://github.com/KingsleyLiu-NV/rsl_rl/blob/fea/actor-critic-conv2d/rsl_rl/modules/actor_critic_conv2d.py
+# https://github.com/isaac-sim/IsaacLab/pull/2027
+# https://github.com/leggedrobotics/rsl_rl/pull/74
 
 import torch
 import torch.nn as nn

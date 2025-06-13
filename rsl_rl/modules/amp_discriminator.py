@@ -69,11 +69,11 @@ class AMPDiscriminator(nn.Module):
         Returns:
             torch.Tensor: Scaled gradient penalty.
         """
-        expert_data.requires_grad_(True)
-        disc = self.forward(expert_data)
-        ones = torch.ones_like(disc, device=expert_data.device)
+        expert_data_copy = expert_data.clone().detach().requires_grad_(True)
+        disc = self.forward(expert_data_copy)
+        ones = torch.ones_like(disc, device=expert_data_copy.device)
         grad = autograd.grad(
-            outputs=disc, inputs=expert_data,
+            outputs=disc, inputs=expert_data_copy,
             grad_outputs=ones, create_graph=True,
             retain_graph=True, only_inputs=True)[0]
 

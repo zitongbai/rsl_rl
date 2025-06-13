@@ -112,6 +112,8 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             
             # amp normalizer
             self.amp_normalizer = EmpiricalNormalization(shape=[num_amp_obs], until=1.0e8).to(self.device)
+        else:
+            self.amp_normalizer = None  # no AMP discriminator
         
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
@@ -264,6 +266,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     
                     # Extract AMP rewards (only for logging)
+                    # TODO: does this need to mutiply by the step dt?
                     rewards = self.alg.sum_rewards if self.alg.amp_discriminator else rewards
                     task_rewards = self.alg.task_rewards if self.alg.amp_discriminator else None
                     amp_rewards = self.alg.amp_rewards if self.alg.amp_discriminator else None
@@ -302,6 +305,11 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                             cur_ireward_sum[new_ids] = 0
                         # -- AMP rewards
                         if self.alg.amp_discriminator:
+                            amp_rew_ids = new_ids if len(new_ids) > 0 else slice(None)
+                            amp_rew_episodic_mean = torch.mean(cur_amp_reward_sum[amp_rew_ids]) / int(self.env.max_episode_length)
+                            if len(ep_infos) > 0:
+                                ep_infos[-1]["Episode_Reward/amp"] = amp_rew_episodic_mean.item()
+                            
                             task_rewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             amp_rewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_task_reward_sum[new_ids] = 0
@@ -490,7 +498,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
 
         # -- Save AMP discriminator and normalizer if used
-        if self.alg.amp_discriminator:
+        if self.alg.amp_discriminator and self.amp_normalizer:
             saved_dict["amp_discriminator_state_dict"] = self.alg.amp_discriminator.state_dict()
             saved_dict["amp_normalizer_state_dict"] = self.amp_normalizer.state_dict()
         
@@ -522,7 +530,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                 # is not loaded, as the observation space could differ from the previous rl training.
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
         # -- Load AMP discriminator and normalizer if used
-        if self.alg.amp_discriminator:
+        if self.alg.amp_discriminator and self.amp_normalizer:
             self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
             self.amp_normalizer.load_state_dict(loaded_dict["amp_normalizer_state_dict"])
         # -- load optimizer if used
@@ -540,14 +548,14 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
     def train_mode(self):
         super().train_mode()
         
-        if self.alg.amp_discriminator:
+        if self.alg.amp_discriminator and self.amp_normalizer:
             self.alg.amp_discriminator.train()
             self.amp_normalizer.train()
         
     def eval_mode(self):
         super().eval_mode()
         
-        if self.alg.amp_discriminator:
+        if self.alg.amp_discriminator and self.amp_normalizer:
             self.alg.amp_discriminator.eval()
             self.amp_normalizer.eval()
         

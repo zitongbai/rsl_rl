@@ -79,10 +79,6 @@ class PPOAmp(PPO):
             # optimizer for policy and discriminator
             params = [
                 {
-                    "name": "actor_critic", 
-                    "params": self.policy.parameters(),
-                }, 
-                {
                     "name": "amp_trunk", 
                     "params": self.amp_discriminator.trunk.parameters(),
                     "weight_decay": self.amp_cfg["amp_trunk_weight_decay"],  # L2 regularization for the discriminator trunk
@@ -93,8 +89,12 @@ class PPOAmp(PPO):
                     "weight_decay": self.amp_cfg["amp_linear_weight_decay"],  # L2 regularization for the discriminator linear layer
                 }
             ]
-            # change the optimizer when AMP is used
-            self.optimizer = optim.Adam(params, lr=learning_rate)
+            # use a separate optimizer for the AMP discriminator
+            self.amp_optimizer = optim.Adam(
+                params,
+                lr=self.amp_cfg["amp_learning_rate"],
+            )
+            self.amp_max_grad_norm = self.amp_cfg["amp_max_grad_norm"]
 
             # Storage
             self.amp_replay_buffer: CircularBuffer = None   # type: ignore
@@ -126,17 +126,22 @@ class PPOAmp(PPO):
                 device=self.device
             )
     
-    def process_env_step(self, rewards, dones, infos, amp_obs):
-        
-        if self.amp_discriminator:
+    def process_env_step(self, rewards, dones, infos, amp_obs=None):
+        if self.amp_discriminator and amp_obs is not None:
             sum_rewards, disc_output, task_rewards, amp_rewards = self.amp_discriminator.predict_amp_reward(amp_obs, rewards)
-            self.amp_replay_buffer.append(amp_obs)
-            self.sum_rewards: torch.Tensor = sum_rewards  # for logging
-            self.disc_outputs: torch.Tensor = disc_output  # for logging
-            self.task_rewards: torch.Tensor = task_rewards  # for logging
-            self.amp_rewards: torch.Tensor = amp_rewards  # for logging
-        
-        super().process_env_step(sum_rewards, dones, infos)
+            self.amp_replay_buffer.append(amp_obs.clone().detach())
+            self.sum_rewards = sum_rewards
+            self.disc_outputs = disc_output
+            self.task_rewards = task_rewards
+            self.amp_rewards = amp_rewards
+            
+            super().process_env_step(sum_rewards, dones, infos)
+        else:
+            # 使用原始奖励
+            super().process_env_step(rewards, dones, infos)
+            # 为了保持一致性，设置这些属性
+            if hasattr(self, 'sum_rewards'):
+                self.sum_rewards = rewards
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
@@ -307,12 +312,12 @@ class PPOAmp(PPO):
                 expert_loss = torch.nn.MSELoss()(
                     expert_disc, torch.ones_like(expert_disc, device=self.device)
                 )
-                amp_loss = 0.5 * (policy_loss + expert_loss)
+                disc_loss = 0.5 * (policy_loss + expert_loss)
                 grad_penalty_loss = self.amp_discriminator.compute_grad_pen(
                     motion_data_batch, scale=self.amp_cfg["grad_penalty_scale"]
                 )
                 
-                loss += amp_loss + grad_penalty_loss
+                amp_loss = disc_loss + grad_penalty_loss
                 
             # Symmetry loss
             if self.symmetry:
@@ -361,7 +366,14 @@ class PPOAmp(PPO):
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
-            loss.backward()
+            
+            if self.amp_discriminator:
+                self.amp_optimizer.zero_grad()
+                loss.backward(retain_graph=True) # retain graph for AMP loss
+                amp_loss.backward()
+            else:
+                loss.backward()
+                
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
@@ -375,6 +387,12 @@ class PPOAmp(PPO):
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            
+            # -- For AMP Discriminator
+            if self.amp_discriminator:
+                nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.amp_max_grad_norm)
+                self.amp_optimizer.step()
+            
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

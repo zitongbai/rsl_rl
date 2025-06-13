@@ -510,8 +510,8 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             self.writer.save_model(path, self.current_learning_iteration) # type: ignore
 
 
-    def load(self, path: str, load_optimizer: bool = True):
-        loaded_dict = torch.load(path, weights_only=False)
+    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None):
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # -- Load RND model if used

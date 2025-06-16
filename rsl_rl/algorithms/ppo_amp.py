@@ -126,22 +126,10 @@ class PPOAmp(PPO):
                 device=self.device
             )
     
-    def process_env_step(self, rewards, dones, infos, amp_obs=None):
-        if self.amp_discriminator and amp_obs is not None:
-            sum_rewards, disc_output, task_rewards, amp_rewards = self.amp_discriminator.predict_amp_reward(amp_obs, rewards)
-            self.amp_replay_buffer.append(amp_obs.clone().detach())
-            self.sum_rewards = sum_rewards
-            self.disc_outputs = disc_output
-            self.task_rewards = task_rewards
-            self.amp_rewards = amp_rewards
-            
-            super().process_env_step(sum_rewards, dones, infos)
-        else:
-            # 使用原始奖励
-            super().process_env_step(rewards, dones, infos)
-            # 为了保持一致性，设置这些属性
-            if hasattr(self, 'sum_rewards'):
-                self.sum_rewards = rewards
+    def process_env_step(self, rewards, dones, infos):
+        self.amp_replay_buffer.append(infos["amp_obs_processed"])
+        super().process_env_step(rewards, dones, infos)
+
 
     def update(self):  # noqa: C901
         mean_value_loss = 0

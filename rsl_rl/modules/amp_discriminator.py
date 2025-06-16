@@ -81,17 +81,18 @@ class AMPDiscriminator(nn.Module):
         grad_penalty = scale * (grad.norm(2, dim=1) - 0).pow(2).mean()
         return grad_penalty
 
-    def predict_amp_reward(self, data: torch.Tensor, task_reward: torch.Tensor):
+    def predict_amp_reward(self, data: torch.Tensor, dt:float, task_reward: torch.Tensor):
         """ Predict the AMP reward based on the discriminator output and task reward.
 
         Args:
             data (torch.Tensor): Input data tensor.
+            dt (float): Time step duration in seconds.
             task_reward (torch.Tensor): Task reward tensor.
         """
         with torch.no_grad():
             self.eval()
             disc = self.forward(data)
-            amp_reward = self.amp_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc - 1), min=0)
+            amp_reward = dt * self.amp_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc - 1), min=0)
             reward = self._lerp_reward(amp_reward, task_reward.unsqueeze(-1))
             self.train()
         return reward.squeeze(), disc.squeeze(), task_reward.squeeze(), amp_reward.squeeze()

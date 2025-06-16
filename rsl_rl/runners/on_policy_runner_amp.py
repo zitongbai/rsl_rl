@@ -214,9 +214,9 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
         # create buffers for logging AMP rewards
         if self.alg.amp_discriminator:
             task_rewbuffer = deque(maxlen=100)
-            amp_rewbuffer = deque(maxlen=100)
+            style_rewbuffer = deque(maxlen=100)
             cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-            cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_style_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             disc_outputs_buffer = deque(maxlen=1000)  # for logging discriminator outputs
 
         # Ensure all parameters are in-synced
@@ -254,24 +254,18 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                         # get AMP observations
                         amp_obs = get_amp_obs(infos["observations"]["amp"], self.env.num_envs, device=self.device)
                         # normalize AMP observations
-                        amp_obs = self.amp_normalizer(amp_obs)
-                        
+                        infos["amp_obs_processed"] = self.amp_normalizer(amp_obs)
+
+                        rewards, disc_outputs, task_rewards, style_rewards = self.alg.amp_discriminator.predict_amp_reward(
+                            infos["amp_obs_processed"], self.env.unwrapped.step_dt, rewards
+                        )
+
                     # process the step
-                    if self.alg.amp_discriminator:
-                        self.alg.process_env_step(rewards, dones, infos, amp_obs=amp_obs)
-                    else:
-                        self.alg.process_env_step(rewards, dones, infos)
+                    self.alg.process_env_step(rewards, dones, infos)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     
-                    # Extract AMP rewards (only for logging)
-                    # TODO: does this need to mutiply by the step dt?
-                    rewards = self.alg.sum_rewards if self.alg.amp_discriminator else rewards
-                    task_rewards = self.alg.task_rewards if self.alg.amp_discriminator else None
-                    amp_rewards = self.alg.amp_rewards if self.alg.amp_discriminator else None
-                    disc_outputs = self.alg.disc_outputs if self.alg.amp_discriminator else None
-
                     # book keeping
                     if self.log_dir is not None:
                         if "episode" in infos:
@@ -287,7 +281,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                             cur_reward_sum += rewards
                         if self.alg.amp_discriminator:
                             cur_task_reward_sum += task_rewards
-                            cur_amp_reward_sum += amp_rewards
+                            cur_style_reward_sum += style_rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -306,14 +300,14 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                         # -- AMP rewards
                         if self.alg.amp_discriminator:
                             amp_rew_ids = new_ids if len(new_ids) > 0 else slice(None)
-                            amp_rew_episodic_mean = torch.mean(cur_amp_reward_sum[amp_rew_ids]) / int(self.env.max_episode_length)
+                            amp_rew_episodic_mean = torch.mean(cur_style_reward_sum[amp_rew_ids]) / (self.env.max_episode_length * self.env.unwrapped.step_dt)
                             if len(ep_infos) > 0:
-                                ep_infos[-1]["Episode_Reward/amp"] = amp_rew_episodic_mean.item()
+                                ep_infos[-1]["Episode_Reward/style"] = amp_rew_episodic_mean.item()
                             
                             task_rewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            amp_rewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            style_rewbuffer.extend(cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_task_reward_sum[new_ids] = 0
-                            cur_amp_reward_sum[new_ids] = 0
+                            cur_style_reward_sum[new_ids] = 0
                             disc_outputs_buffer.extend(disc_outputs.cpu().numpy().tolist()) # type: ignore
 
                 stop = time.time()
@@ -410,7 +404,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             # separate logging for AMP rewards
             if self.alg.amp_discriminator:
                 self.writer.add_scalar("AMP/mean_task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"]) # type: ignore
-                self.writer.add_scalar("AMP/mean_amp_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"]) # type: ignore
+                self.writer.add_scalar("AMP/mean_style_reward", statistics.mean(locs["style_rewbuffer"]), locs["it"]) # type: ignore
                 self.writer.add_scalar("AMP/mean_disc_output", statistics.mean(locs["disc_outputs_buffer"]), locs["it"]) # type: ignore
                 self.writer.add_scalar("AMP/amp_reward_scale", self.alg.amp_discriminator.amp_reward_scale, locs["it"]) # type: ignore
                 self.writer.add_scalar("AMP/amp_reward_lerp", self.alg.amp_discriminator.task_reward_lerp, locs["it"]) # type: ignore
@@ -447,7 +441,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             if self.alg.amp_discriminator:
                 log_string += (
                     f"""{'Mean task reward:':>{pad}} {statistics.mean(locs['task_rewbuffer']):.2f}\n"""
-                    f"""{'Mean AMP reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n"""
+                    f"""{'Mean style reward:':>{pad}} {statistics.mean(locs['style_rewbuffer']):.2f}\n"""
                     f"""{'Mean discriminator output:':>{pad}} {statistics.mean(locs['disc_outputs_buffer']):.2f}\n"""
                 )
             # -- episode info

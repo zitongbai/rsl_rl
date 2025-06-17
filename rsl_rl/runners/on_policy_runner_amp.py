@@ -110,8 +110,12 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             # this is used by the AMP discriminator to handle the input dimension
             self.alg_cfg["amp_cfg"]["num_amp_obs"] = num_amp_obs
             
+            if num_amp_obs % 2 != 0:
+                raise ValueError(f"num_amp_obs ({num_amp_obs}) must be divisible by 2 (because 2 steps) for AMP discriminator.")
+            
             # amp normalizer
-            self.amp_normalizer = EmpiricalNormalization(shape=[num_amp_obs], until=1.0e8).to(self.device)
+            self.amp_normalizer = EmpiricalNormalization(shape=[int(num_amp_obs//2)], until=1.0e8).to(self.device)
+            self.alg_cfg["amp_cfg"]["_amp_normalizer"] = self.amp_normalizer
         else:
             self.amp_normalizer = None  # no AMP discriminator
         
@@ -253,11 +257,10 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                     if self.alg.amp_discriminator:
                         # get AMP observations
                         amp_obs = get_amp_obs(infos["observations"]["amp"], self.env.num_envs, device=self.device)
-                        # normalize AMP observations
-                        infos["amp_obs_processed"] = self.amp_normalizer(amp_obs)
+                        infos["amp_obs_processed"] = amp_obs
 
                         rewards, disc_outputs, task_rewards, style_rewards = self.alg.amp_discriminator.predict_amp_reward(
-                            infos["amp_obs_processed"], self.env.unwrapped.step_dt, rewards
+                            infos["amp_obs_processed"], self.env.unwrapped.step_dt, rewards, self.amp_normalizer
                         )
 
                     # process the step

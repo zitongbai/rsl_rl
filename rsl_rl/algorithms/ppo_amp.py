@@ -12,6 +12,7 @@ from rsl_rl.utils import string_to_callable
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.modules.amp_discriminator import AMPDiscriminator
+from rsl_rl.modules.normalizer import EmpiricalNormalization
 
 
 class PPOAmp(PPO):
@@ -102,6 +103,9 @@ class PPOAmp(PPO):
             # Motion loader
             self.motion_loader = self.amp_cfg["_motion_loader"]
             
+            # AMP normalizer (amp obs and motion data share the same normalizer)
+            self.amp_normalizer: EmpiricalNormalization = self.amp_cfg["_amp_normalizer"]
+
         else:
             self.amp_discriminator = None
 
@@ -292,6 +296,19 @@ class PPOAmp(PPO):
 
             # Discriminator loss
             if self.amp_discriminator:
+                with torch.no_grad():
+                    num_amp_obs_1_step = int(amp_replay_batch.shape[1] // 2)
+                    
+                    self.amp_normalizer.eval()
+                    # only forward, no update
+                    amp_replay_batch[:, num_amp_obs_1_step:] = self.amp_normalizer(amp_replay_batch[:, num_amp_obs_1_step:])
+                    motion_data_batch[:, num_amp_obs_1_step:] = self.amp_normalizer(motion_data_batch[:, num_amp_obs_1_step:])
+                    
+                    self.amp_normalizer.train()
+                    # forward and update the AMP normalizer
+                    amp_replay_batch[:, :num_amp_obs_1_step] = self.amp_normalizer(amp_replay_batch[:, :num_amp_obs_1_step])
+                    motion_data_batch[:, :num_amp_obs_1_step] = self.amp_normalizer(motion_data_batch[:, :num_amp_obs_1_step])
+                
                 policy_disc = self.amp_discriminator(amp_replay_batch)
                 expert_disc = self.amp_discriminator(motion_data_batch)
                 policy_loss = torch.nn.MSELoss()(

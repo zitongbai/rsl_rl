@@ -191,35 +191,33 @@ class CircularBuffer:
         if epoch_batch_size % num_mini_batches != 0:
             raise ValueError(f"Epoch batch size {epoch_batch_size} is not divisible by number of mini-batches {num_mini_batches}.")
         
-        all_indices = torch.arange(self.max_length, dtype=torch.long, device=self.device)
-        # Shift the indices to have the most recent data at the end
-        shifted_indices = torch.roll(all_indices, shifts=self.max_length - self._pointer - 1)
-        # Get the available indices in history dim
-        available_indices = shifted_indices[-min_current_length:]
-    
-        # Randomly select indices from the available history
-        history_indices = available_indices[torch.randperm(len(available_indices), device=self.device)[:fetch_length]]
-        fetch_buf = self._buffer[history_indices, :].flatten(0, 1) # (fetch_length * batch_size, ...)
+        # Assume that every element in self._num_pushes are equal
+        total_combinations = self.current_length[0] * self.batch_size
+        linear_indices = torch.randperm(total_combinations, device=self.device)[:epoch_batch_size]
+        # Convert linear indices to batch and fetch indices
+        indices_0 = linear_indices // self.batch_size
+        indices_1 = linear_indices % self.batch_size
         
         for epoch in range(num_epochs):
-            indices = torch.randperm(fetch_buf.shape[0], requires_grad=False, device=self.device)
+            indices = torch.randperm(epoch_batch_size, requires_grad=False, device=self.device)
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
-                batch_idx = indices[start:end]
+                mini_indices_0 = indices_0[indices[start:end]]
+                mini_indices_1 = indices_1[indices[start:end]]
                 
-                yield fetch_buf[batch_idx]
+                yield self._buffer[mini_indices_0, mini_indices_1]
                 
                 
 if __name__ == "__main__":
     
-    max_len = 10000
-    batch_size = 128
+    max_len = 50
+    batch_size = 32
     cb = CircularBuffer(max_len, batch_size, "cpu")
     for i in range(64):
-        data = torch.rand((batch_size, 10), device="cpu")
+        data = i * torch.ones((batch_size, 4), dtype=torch.float32, device="cpu")
         cb.append(data)
 
-    generator = cb.mini_batch_generator(24, 8)
+    generator = cb.mini_batch_generator(fetch_length=24, num_mini_batches=4, num_epochs=5)
     for data in generator:
-        print(f"data shape: {data.shape}")
+        print(data)

@@ -75,6 +75,16 @@ class EmpiricalNormalization(nn.Module):
     def inverse(self, y):
         return y * (self._std + self.eps) + self._mean
 
+    def forward_no_update(self, x):
+        """Normalize mean and variance of values based on empirical values without updating the internal state.
+
+        Args:
+            x (ndarray or Variable): Input values
+
+        Returns:
+            ndarray or Variable: Normalized output values
+        """
+        return (x - self._mean) / (self._std + self.eps)
 
 class EmpiricalDiscountedVariationNormalization(nn.Module):
     """Reward normalization from Pathak's large scale study on PPO.

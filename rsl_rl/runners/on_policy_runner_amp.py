@@ -258,8 +258,9 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                         # get AMP observations
                         amp_obs = get_amp_obs(infos["observations"]["amp"], self.env.num_envs, device=self.device)
                         infos["amp_obs_processed"] = amp_obs
-
-                        rewards, disc_outputs, task_rewards, style_rewards = self.alg.amp_discriminator.predict_amp_reward(
+                        
+                        task_rewards = rewards.clone()
+                        rewards, disc_outputs, style_rewards = self.alg.amp_discriminator.predict_amp_reward(
                             infos["amp_obs_processed"], self.env.unwrapped.step_dt, rewards, self.amp_normalizer
                         )
 

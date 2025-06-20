@@ -298,19 +298,15 @@ class PPOAmp(PPO):
             if self.amp_discriminator:
                 with torch.no_grad():
                     num_amp_obs_1_step = int(amp_replay_batch.shape[1] // 2)
-                    
-                    self.amp_normalizer.eval()
-                    # only forward, no update
-                    amp_replay_batch[:, num_amp_obs_1_step:] = self.amp_normalizer(amp_replay_batch[:, num_amp_obs_1_step:])
-                    motion_data_batch[:, num_amp_obs_1_step:] = self.amp_normalizer(motion_data_batch[:, num_amp_obs_1_step:])
-                    
-                    self.amp_normalizer.train()
-                    # forward and update the AMP normalizer
-                    amp_replay_batch[:, :num_amp_obs_1_step] = self.amp_normalizer(amp_replay_batch[:, :num_amp_obs_1_step])
-                    motion_data_batch[:, :num_amp_obs_1_step] = self.amp_normalizer(motion_data_batch[:, :num_amp_obs_1_step])
+                    amp_replay_batch_norm = amp_replay_batch.clone()
+                    motion_data_batch_norm = motion_data_batch.clone()
+                    amp_replay_batch_norm[:, num_amp_obs_1_step:] = self.amp_normalizer.forward_no_update(amp_replay_batch[:, num_amp_obs_1_step:])
+                    motion_data_batch_norm[:, num_amp_obs_1_step:] = self.amp_normalizer.forward_no_update(motion_data_batch[:, num_amp_obs_1_step:])
+                    amp_replay_batch_norm[:, :num_amp_obs_1_step] = self.amp_normalizer.forward_no_update(amp_replay_batch[:, :num_amp_obs_1_step])
+                    motion_data_batch_norm[:, :num_amp_obs_1_step] = self.amp_normalizer.forward_no_update(motion_data_batch[:, :num_amp_obs_1_step])
                 
-                policy_disc = self.amp_discriminator(amp_replay_batch)
-                expert_disc = self.amp_discriminator(motion_data_batch)
+                policy_disc = self.amp_discriminator(amp_replay_batch_norm)
+                expert_disc = self.amp_discriminator(motion_data_batch_norm)
                 policy_loss = torch.nn.MSELoss()(
                     policy_disc, -1 * torch.ones_like(policy_disc, device=self.device)
                 )
@@ -319,7 +315,7 @@ class PPOAmp(PPO):
                 )
                 disc_loss = 0.5 * (policy_loss + expert_loss)
                 grad_penalty_loss = self.amp_discriminator.compute_grad_pen(
-                    motion_data_batch, scale=self.amp_cfg["grad_penalty_scale"]
+                    motion_data_batch_norm, scale=self.amp_cfg["grad_penalty_scale"]
                 )
                 
                 amp_loss = disc_loss + grad_penalty_loss
@@ -395,8 +391,11 @@ class PPOAmp(PPO):
             
             # -- For AMP Discriminator
             if self.amp_discriminator:
-                nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.amp_max_grad_norm)
+                # nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.amp_max_grad_norm)
                 self.amp_optimizer.step()
+                
+                self.amp_normalizer.update(amp_replay_batch[:, :num_amp_obs_1_step])
+                self.amp_normalizer.update(motion_data_batch[:, :num_amp_obs_1_step])
             
             # -- For RND
             if self.rnd_optimizer:

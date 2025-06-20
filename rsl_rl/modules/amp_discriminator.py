@@ -69,7 +69,9 @@ class AMPDiscriminator(nn.Module):
         Returns:
             torch.Tensor: Scaled gradient penalty.
         """
+        
         expert_data_copy = expert_data.clone().detach().requires_grad_(True)
+
         disc = self.forward(expert_data_copy)
         ones = torch.ones_like(disc, device=expert_data_copy.device)
         grad = autograd.grad(
@@ -91,20 +93,20 @@ class AMPDiscriminator(nn.Module):
         """
         with torch.no_grad():
             self.eval()
-            amp_normalizer.eval()
             
             # Normalize the input data
             num_amp_obs_1_step = int(data.shape[1] // 2)
-            data[:, :num_amp_obs_1_step] = amp_normalizer(data[:, :num_amp_obs_1_step])
-            data[:, num_amp_obs_1_step:] = amp_normalizer(data[:, num_amp_obs_1_step:])
+            data_copy = data.clone().detach()
+            data_copy[:, :num_amp_obs_1_step] = amp_normalizer.forward_no_update(data[:, :num_amp_obs_1_step])
+            data_copy[:, num_amp_obs_1_step:] = amp_normalizer.forward_no_update(data[:, num_amp_obs_1_step:])
             
             # Compute the discriminator output
-            disc = self.forward(data)
+            disc = self.forward(data_copy)
             amp_reward = dt * self.amp_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc - 1), min=0)
             reward = self._lerp_reward(amp_reward, task_reward.unsqueeze(-1))
             self.train()
-            amp_normalizer.train()
-        return reward.squeeze(), disc.squeeze(), task_reward.squeeze(), amp_reward.squeeze()
+
+        return reward.squeeze(), disc.squeeze(), amp_reward.squeeze()
 
     def _lerp_reward(self, amp_rew: torch.Tensor, task_rew: torch.Tensor):
         """Linearly interpolate between the AMP reward and the task reward."""

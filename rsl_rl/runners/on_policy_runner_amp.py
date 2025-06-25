@@ -12,6 +12,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
+    ActorCriticConv2d,
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
@@ -75,9 +76,16 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
         else:
             num_privileged_obs = num_obs
         
+        # resolve shapes of image if present
+        if "image" in extras["observations"]:
+            # Convert from [N, H, W, C] to [C, H, W]
+            input_image_shape = extras["observations"]["image"].permute(0, 3, 1, 2).shape[1:]
+            self.policy_cfg["input_image_shape"] = input_image_shape
+            num_image_obs = torch.prod(torch.tensor(input_image_shape)).item()
+        
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticConv2d | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
         
@@ -139,14 +147,24 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
         
         # init storage and model
-        self.alg.init_storage(
-            self.training_type,
-            self.env.num_envs,
-            self.num_steps_per_env,
-            [num_obs],
-            [num_privileged_obs],
-            [self.env.num_actions],
-        )
+        if "image" in extras["observations"]:
+            self.alg.init_storage(
+                self.training_type,
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs + num_image_obs],
+                [num_privileged_obs + num_image_obs],
+                [self.env.num_actions],
+            )
+        else:
+            self.alg.init_storage(
+                self.training_type,
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs],
+                [num_privileged_obs],
+                [self.env.num_actions],
+            )
         
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -196,6 +214,12 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
         # start learning
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        if "image" in extras["observations"]:
+            # get image
+            image_obs = extras["observations"]["image"].permute(0, 3, 1, 2).flatten(start_dim=1)
+            # concatenate proprioceptive observations with image
+            obs = torch.cat([obs, image_obs], dim=1)
+            privileged_obs = torch.cat([privileged_obs, image_obs], dim=1)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         if self.alg.amp_discriminator:
             amp_obs = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
@@ -252,6 +276,12 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                         )
                     else:
                         privileged_obs = obs
+                    
+                    if "image" in extras["observations"]:
+                        # Concatenate image observations with proprioceptive observations
+                        image_obs = infos["observations"]["image"].permute(0, 3, 1, 2).flatten(start_dim=1).to(self.device)
+                        obs = torch.cat([obs, image_obs], dim=1)
+                        privileged_obs = torch.cat([privileged_obs, image_obs], dim=1)
                     
                     # For AMP
                     if self.alg.amp_discriminator:

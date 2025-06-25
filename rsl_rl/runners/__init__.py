@@ -7,7 +7,6 @@
 
 from .on_policy_runner import OnPolicyRunner
 from .on_policy_runner_amp import OnPolicyRunnerAMP
-from .on_policy_runner_conv2d import OnPolicyRunnerConv2d
 
-__all__ = ["OnPolicyRunner", "OnPolicyRunnerAMP", "OnPolicyRunnerConv2d"]
+__all__ = ["OnPolicyRunner", "OnPolicyRunnerAMP"]
 

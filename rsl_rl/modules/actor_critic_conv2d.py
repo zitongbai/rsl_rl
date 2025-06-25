@@ -40,7 +40,7 @@ class ConvolutionalNetwork(nn.Module):
         self,
         proprio_input_dim,
         output_dim,
-        image_input_shape,
+        input_image_shape,
         conv_layers_params,
         hidden_dims,
         activation_fn,
@@ -48,8 +48,8 @@ class ConvolutionalNetwork(nn.Module):
     ):
         super().__init__()
 
-        self.image_input_shape = image_input_shape  # (C, H, W)
-        self.image_obs_size = torch.prod(torch.tensor(self.image_input_shape)).item()
+        self.input_image_shape = input_image_shape  # (C, H, W)
+        self.image_obs_size = torch.prod(torch.tensor(self.input_image_shape)).item()
         self.proprio_obs_size = proprio_input_dim
         self.input_dim = self.proprio_obs_size + self.image_obs_size
         self.activation_fn = activation_fn
@@ -57,7 +57,7 @@ class ConvolutionalNetwork(nn.Module):
         # Build conv network and get its output size
         self.conv_net = self.build_conv_net(conv_layers_params)
         with torch.no_grad():
-            dummy_image = torch.zeros(1, *self.image_input_shape)
+            dummy_image = torch.zeros(1, *self.input_image_shape)
             conv_output = self.conv_net(dummy_image)
             self.image_feature_size = conv_output.view(1, -1).shape[1]
 
@@ -82,7 +82,7 @@ class ConvolutionalNetwork(nn.Module):
 
     def build_conv_net(self, conv_layers_params):
         layers = []
-        in_channels = self.image_input_shape[0]
+        in_channels = self.input_image_shape[0]
         for idx, params in enumerate(conv_layers_params[:-1]):
             layers.extend([
                 nn.Conv2d(
@@ -133,7 +133,7 @@ class ConvolutionalNetwork(nn.Module):
         image_obs = observations[:, -self.image_obs_size :]
 
         batch_size = image_obs.size(0)
-        image = image_obs.view(batch_size, *self.image_input_shape)
+        image = image_obs.view(batch_size, *self.input_image_shape)
 
         conv_features = self.conv_net(image)
         flattened_conv_features = conv_features.view(batch_size, -1)
@@ -151,7 +151,7 @@ class ActorCriticConv2d(nn.Module):
         num_actor_obs,
         num_critic_obs,
         num_actions,
-        image_input_shape,
+        input_image_shape,
         conv_layers_params,
         conv_linear_output_size,
         actor_hidden_dims,
@@ -162,13 +162,13 @@ class ActorCriticConv2d(nn.Module):
     ):
         super().__init__()
 
-        self.image_input_shape = image_input_shape  # (C, H, W)
+        self.input_image_shape = input_image_shape  # (C, H, W)
         self.activation_fn = resolve_nn_activation(activation)
 
         self.actor = ConvolutionalNetwork(
             proprio_input_dim=num_actor_obs,
             output_dim=num_actions,
-            image_input_shape=image_input_shape,
+            input_image_shape=input_image_shape,
             conv_layers_params=conv_layers_params,
             hidden_dims=actor_hidden_dims,
             activation_fn=self.activation_fn,
@@ -178,7 +178,7 @@ class ActorCriticConv2d(nn.Module):
         self.critic = ConvolutionalNetwork(
             proprio_input_dim=num_critic_obs,
             output_dim=1,
-            image_input_shape=image_input_shape,
+            input_image_shape=input_image_shape,
             conv_layers_params=conv_layers_params,
             hidden_dims=critic_hidden_dims,
             activation_fn=self.activation_fn,

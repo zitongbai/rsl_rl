@@ -12,6 +12,7 @@ from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .amp_discriminator import AMPDiscriminator
+from .actor_critic_conv2d import ActorCriticConv2d
 
 __all__ = [
     "ActorCritic",
@@ -21,4 +22,5 @@ __all__ = [
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "AMPDiscriminator",
+    "ActorCriticConv2d",
 ]

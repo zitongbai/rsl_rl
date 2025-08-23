@@ -111,7 +111,8 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
         
         if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"] is not None:
             # this is used by the AMP algorithm to handle motion loading
-            self.alg_cfg["amp_cfg"]["_motion_loader"] = self.env.unwrapped.motion_loader
+            motion_dataset: str = self.alg_cfg["amp_cfg"]["motion_dataset"]
+            self.alg_cfg["amp_cfg"]["_motion_loader"] = self.env.unwrapped.motion_data_manager.get_term(motion_dataset)
             # amp observation dim (with 2 steps concatenated)
             amp_obs = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
             num_amp_obs = amp_obs.shape[1]

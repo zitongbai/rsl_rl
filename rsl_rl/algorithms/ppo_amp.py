@@ -73,7 +73,8 @@ class PPOAmp(PPO):
         # AMP Discriminator
         if self.amp_cfg is not None:
             self.amp_discriminator = AMPDiscriminator(
-                input_dim=self.amp_cfg["num_amp_obs"],
+                num_amp_obs=self.amp_cfg["num_amp_obs"], 
+                num_amp_steps=self.amp_cfg["num_amp_steps"],
                 **self.amp_cfg["amp_discriminator"]
             ).to(self.device)
             
@@ -297,13 +298,13 @@ class PPOAmp(PPO):
             # Discriminator loss
             if self.amp_discriminator:
                 with torch.no_grad():
-                    num_amp_obs_1_step = int(amp_replay_batch.shape[1] // 2)
+                    num_amp_obs = self.amp_cfg["num_amp_obs"]
+                    num_amp_steps = self.amp_cfg["num_amp_steps"]
                     amp_replay_batch_norm = amp_replay_batch.clone()
                     motion_data_batch_norm = motion_data_batch.clone()
-                    amp_replay_batch_norm[:, num_amp_obs_1_step:] = self.amp_normalizer.forward_no_update(amp_replay_batch[:, num_amp_obs_1_step:])
-                    motion_data_batch_norm[:, num_amp_obs_1_step:] = self.amp_normalizer.forward_no_update(motion_data_batch[:, num_amp_obs_1_step:])
-                    amp_replay_batch_norm[:, :num_amp_obs_1_step] = self.amp_normalizer.forward_no_update(amp_replay_batch[:, :num_amp_obs_1_step])
-                    motion_data_batch_norm[:, :num_amp_obs_1_step] = self.amp_normalizer.forward_no_update(motion_data_batch[:, :num_amp_obs_1_step])
+                    for i in range(num_amp_steps):
+                        amp_replay_batch_norm[:, i*num_amp_obs:(i+1)*num_amp_obs] = self.amp_normalizer.forward_no_update(amp_replay_batch[:, i*num_amp_obs:(i+1)*num_amp_obs])
+                        motion_data_batch_norm[:, i*num_amp_obs:(i+1)*num_amp_obs] = self.amp_normalizer.forward_no_update(motion_data_batch[:, i*num_amp_obs:(i+1)*num_amp_obs])
                 
                 policy_disc = self.amp_discriminator(amp_replay_batch_norm)
                 expert_disc = self.amp_discriminator(motion_data_batch_norm)
@@ -394,8 +395,8 @@ class PPOAmp(PPO):
                 # nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.amp_max_grad_norm)
                 self.amp_optimizer.step()
                 
-                self.amp_normalizer.update(amp_replay_batch[:, :num_amp_obs_1_step])
-                self.amp_normalizer.update(motion_data_batch[:, :num_amp_obs_1_step])
+                self.amp_normalizer.update(amp_replay_batch[:, :num_amp_obs])
+                self.amp_normalizer.update(motion_data_batch[:, :num_amp_obs])
             
             # -- For RND
             if self.rnd_optimizer:

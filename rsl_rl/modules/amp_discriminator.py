@@ -6,10 +6,12 @@ import torch
 import torch.nn as nn
 from torch import autograd
 from rsl_rl.utils import resolve_nn_activation
+from rsl_rl.modules.normalizer import EmpiricalNormalization
 
 class AMPDiscriminator(nn.Module):
     def __init__(self, 
-            input_dim, 
+            num_amp_obs: int,
+            num_amp_steps: int,
             hidden_dims = [256, 256, 256],
             activation="relu",
             amp_reward_scale=1.0, 
@@ -25,7 +27,9 @@ class AMPDiscriminator(nn.Module):
             task_reward_lerp (float, optional): The linear interpolation factor for the task reward. Defaults to 0.0.
         """
         super().__init__()
-        self.input_dim = input_dim
+        self.input_dim = num_amp_obs * num_amp_steps
+        self.num_amp_obs = num_amp_obs
+        self.num_amp_steps = num_amp_steps
         activation = resolve_nn_activation(activation)
         assert amp_reward_scale >= 0, "AMP reward scale must be non-negative."
         assert 0 <= task_reward_lerp <= 1, "Task reward lerp factor must be in [0, 1]."
@@ -34,7 +38,7 @@ class AMPDiscriminator(nn.Module):
         
         # build the discriminator network
         amp_layers = []
-        curr_in_dim = input_dim
+        curr_in_dim = self.input_dim
         for hidden_dim in hidden_dims:
             amp_layers.append(nn.Linear(curr_in_dim, hidden_dim))
             amp_layers.append(activation)
@@ -83,7 +87,7 @@ class AMPDiscriminator(nn.Module):
         grad_penalty = scale * (grad.norm(2, dim=1) - 0).pow(2).mean()
         return grad_penalty
 
-    def predict_amp_reward(self, data: torch.Tensor, dt:float, task_reward: torch.Tensor, amp_normalizer: nn.Module):
+    def predict_amp_reward(self, data: torch.Tensor, dt:float, task_reward: torch.Tensor, amp_normalizer: EmpiricalNormalization):
         """ Predict the AMP reward based on the discriminator output and task reward.
 
         Args:
@@ -91,15 +95,18 @@ class AMPDiscriminator(nn.Module):
             dt (float): Time step duration in seconds.
             task_reward (torch.Tensor): Task reward tensor.
         """
+        
+        if self.num_amp_obs * self.num_amp_steps != data.shape[1]:
+            raise ValueError(f"[AMPDiscriminator] Input data dimension 1 {data.shape[1]} does not match expected dimension {self.num_amp_obs * self.num_amp_steps}.")
+        
         with torch.no_grad():
             self.eval()
             
             # Normalize the input data
-            num_amp_obs_1_step = int(data.shape[1] // 2)
             data_copy = data.clone().detach()
-            data_copy[:, :num_amp_obs_1_step] = amp_normalizer.forward_no_update(data[:, :num_amp_obs_1_step])
-            data_copy[:, num_amp_obs_1_step:] = amp_normalizer.forward_no_update(data[:, num_amp_obs_1_step:])
-            
+            for i in range(self.num_amp_steps):
+                data_copy[:, i*self.num_amp_obs:(i+1)*self.num_amp_obs] = amp_normalizer.forward_no_update(data[:, i*self.num_amp_obs:(i+1)*self.num_amp_obs])
+
             # Compute the discriminator output
             disc = self.forward(data_copy)
             amp_reward = dt * self.amp_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc - 1), min=0)

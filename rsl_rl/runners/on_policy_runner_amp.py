@@ -26,9 +26,15 @@ from typing import TYPE_CHECKING
 # TODO: init state from motion loader
 
 def get_amp_obs(amp_obs_dict: dict[str, torch.Tensor], num_envs, device="cpu"):
-    """Helper function to get AMP observations from the amp_obs_dict."""
-    amp_obs = torch.cat(list(amp_obs_dict.values()), dim=-1).reshape(num_envs, -1).to(device)
-    return amp_obs
+    """Helper function to get AMP observations from the amp_obs_dict.
+
+    Each value in amp_obs_dict is of shape [num_envs, history_length, obs_dim].
+    """
+    amp_obs = torch.cat(list(amp_obs_dict.values()), dim=-1)
+    num_amp_steps = amp_obs.shape[1]
+    num_amp_obs = amp_obs.shape[2]
+    amp_obs_flatten = amp_obs.reshape(num_envs, -1).to(device)
+    return amp_obs_flatten, num_amp_steps, num_amp_obs
 
 
 class OnPolicyRunnerAMP(OnPolicyRunner):
@@ -114,16 +120,13 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             motion_dataset: str = self.alg_cfg["amp_cfg"]["motion_dataset"]
             self.alg_cfg["amp_cfg"]["_motion_loader"] = self.env.unwrapped.motion_data_manager.get_term(motion_dataset)
             # amp observation dim (with 2 steps concatenated)
-            amp_obs = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
-            num_amp_obs = amp_obs.shape[1]
+            _, num_amp_steps, num_amp_obs = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
             # this is used by the AMP discriminator to handle the input dimension
+            self.alg_cfg["amp_cfg"]["num_amp_steps"] = num_amp_steps
             self.alg_cfg["amp_cfg"]["num_amp_obs"] = num_amp_obs
             
-            if num_amp_obs % 2 != 0:
-                raise ValueError(f"num_amp_obs ({num_amp_obs}) must be divisible by 2 (because 2 steps) for AMP discriminator.")
-            
             # amp normalizer
-            self.amp_normalizer = EmpiricalNormalization(shape=[int(num_amp_obs//2)], until=1.0e8).to(self.device)
+            self.amp_normalizer = EmpiricalNormalization(shape=[num_amp_obs], until=1.0e8).to(self.device)
             self.alg_cfg["amp_cfg"]["_amp_normalizer"] = self.amp_normalizer
         else:
             self.amp_normalizer = None  # no AMP discriminator
@@ -223,7 +226,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
             privileged_obs = torch.cat([privileged_obs, image_obs], dim=1)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         if self.alg.amp_discriminator:
-            amp_obs = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
+            amp_obs, _, _ = get_amp_obs(extras["observations"]["amp"], self.env.num_envs, device=self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
         
         # Book keeping
@@ -287,7 +290,7 @@ class OnPolicyRunnerAMP(OnPolicyRunner):
                     # For AMP
                     if self.alg.amp_discriminator:
                         # get AMP observations
-                        amp_obs = get_amp_obs(infos["observations"]["amp"], self.env.num_envs, device=self.device)
+                        amp_obs, _, _ = get_amp_obs(infos["observations"]["amp"], self.env.num_envs, device=self.device)
                         infos["amp_obs_processed"] = amp_obs
                         
                         task_rewards = rewards.clone()

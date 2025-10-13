@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from itertools import chain
+
+from rsl_rl.modules import ActorCritic
+from rsl_rl.modules.rnd import RandomNetworkDistillation
+from rsl_rl.modules.amp import AMPDiscriminator
+from rsl_rl.storage import RolloutStorage, CircularBuffer
+from rsl_rl.utils import string_to_callable
+from rsl_rl.algorithms import PPO
+from rsl_rl.networks import EmpiricalNormalization
+
+class PPOAmp(PPO):
+    policy: ActorCritic
+    def __init__(
+        self,
+        policy,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        clip_param=0.2,
+        gamma=0.99,
+        lam=0.95,
+        value_loss_coef=1.0,
+        entropy_coef=0.01,
+        learning_rate=0.001,
+        max_grad_norm=1.0,
+        use_clipped_value_loss=True,
+        schedule="adaptive",
+        desired_kl=0.01,
+        device="cpu",
+        normalize_advantage_per_mini_batch=False,
+        # RND parameters
+        rnd_cfg: dict | None = None,
+        # Symmetry parameters
+        symmetry_cfg: dict | None = None,
+        # AMP parameters
+        amp_cfg: dict | None = None,
+        # Distributed training parameters
+        multi_gpu_cfg: dict | None = None,
+    ):
+        super().__init__(
+            policy,
+            num_learning_epochs,
+            num_mini_batches,
+            clip_param,
+            gamma,
+            lam,
+            value_loss_coef,
+            entropy_coef,
+            learning_rate,
+            max_grad_norm,
+            use_clipped_value_loss,
+            schedule,
+            desired_kl,
+            device,
+            normalize_advantage_per_mini_batch,
+            rnd_cfg=rnd_cfg,
+            symmetry_cfg=symmetry_cfg,
+            multi_gpu_cfg=multi_gpu_cfg,
+        )
+        
+        self.amp_cfg = amp_cfg
+        
+        if self.amp_cfg is None:
+            raise ValueError("[PPOAmp] AMP configuration is None. Please provide a valid AMP configuration.")
+        
+        self.amp_discriminator = AMPDiscriminator(
+            num_amp_obs=self.amp_cfg["num_amp_obs"],
+            num_amp_steps=self.amp_cfg["num_amp_steps"],
+            obs_groups=self.policy.obs_groups,
+            device=device,
+            **self.amp_cfg.get("amp_discriminator", {})
+        ).to(self.device)
+        
+        # optimizer for policy and discriminator
+        params = [
+            {
+                "name": "amp_trunk", 
+                "params": self.amp_discriminator.trunk.parameters(),
+                "weight_decay": self.amp_cfg["amp_trunk_weight_decay"],  # L2 regularization for the discriminator trunk
+            },
+            {
+                "name": "amp_linear",
+                "params": self.amp_discriminator.amp_linear.parameters(),
+                "weight_decay": self.amp_cfg["amp_linear_weight_decay"],  # L2 regularization for the discriminator linear layer
+            }
+        ]
+        # use a separate optimizer for the AMP discriminator
+        self.amp_optimizer = optim.Adam(
+            params,
+            lr=self.amp_cfg["amp_learning_rate"],
+        )
+        self.amp_max_grad_norm = self.amp_cfg["amp_max_grad_norm"]
+        
+        # Storage
+        self.amp_replay_buffer: CircularBuffer = None   # type: ignore
+        
+        # Motion loader
+        self.motion_loader = self.amp_cfg["_motion_loader"]
+        
+    def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
+        super().init_storage(training_type, num_envs, num_transitions_per_env, obs, actions_shape)
+        
+        # Initialize AMP replay buffer
+        self.amp_replay_buffer = CircularBuffer(
+            max_len=self.amp_cfg["replay_buffer_size"],
+            batch_size=num_envs, 
+            device=self.device,
+        )
+        
+    def process_env_step(self, obs, rewards, dones, extras):        
+        # Get the AMP observation
+        amp_obs = self.amp_discriminator.get_amp_obs(obs, flatten_history_dim=False)
+        # # Only use the most recent step to update the normalizer
+        # self.amp_discriminator.update_normalization(amp_obs[:, -1, :]) 
+        # Compute the AMP reward
+        self.amp_rewards, self.disc_outputs = self.amp_discriminator.predict_amp_reward(amp_obs, dt=self.amp_cfg["step_dt"])
+        # Linearly interpolate between the AMP reward and the task reward
+        rewards_lerp = self.amp_discriminator.lerp_reward(self.amp_rewards, rewards)
+        # Store the AMP observation (Unnormalized) in the replay buffer
+        num_envs = amp_obs.shape[0]
+        self.amp_replay_buffer.append(amp_obs.view(num_envs, -1))  # flatten the history dimension and store
+        # process the step as usual
+        super().process_env_step(obs, rewards_lerp, dones, extras)
+        
+
+    def update(self):  # noqa: C901
+        mean_value_loss = 0
+        mean_surrogate_loss = 0
+        mean_entropy = 0
+        # -- RND loss
+        if self.rnd:
+            mean_rnd_loss = 0
+        else:
+            mean_rnd_loss = None
+        # -- Symmetry loss
+        if self.symmetry:
+            mean_symmetry_loss = 0
+        else:
+            mean_symmetry_loss = None
+        # -- AMP loss
+        mean_amp_loss = 0
+        mean_grad_penalty_loss = 0
+        mean_policy_disc = 0
+        mean_expert_disc = 0
+
+        # generator for mini batches
+        if self.policy.is_recurrent:
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        else:
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+        # AMP replay buffer generator
+        amp_replay_generator = self.amp_replay_buffer.mini_batch_generator(
+            fetch_length=self.storage.num_transitions_per_env,
+            num_mini_batches=self.num_mini_batches,
+            num_epochs=self.num_learning_epochs
+        )
+        
+        # Motion loader generator
+        motion_loader_generator = self.motion_loader.mini_batch_generator(
+            num_transitions_per_env=self.storage.num_transitions_per_env,
+            num_mini_batches=self.num_mini_batches,
+            num_epochs=self.num_learning_epochs
+        )
+
+        # iterate over batches
+        # for (
+        #     obs_batch,
+        #     actions_batch,
+        #     target_values_batch,
+        #     advantages_batch,
+        #     returns_batch,
+        #     old_actions_log_prob_batch,
+        #     old_mu_batch,
+        #     old_sigma_batch,
+        #     hid_states_batch,
+        #     masks_batch,
+        # ) in generator:
+        for sample, amp_replay_batch, motion_data_batch in zip(
+            generator, amp_replay_generator, motion_loader_generator
+        ):
+            (
+                obs_batch,
+                actions_batch,
+                target_values_batch,
+                advantages_batch,
+                returns_batch,
+                old_actions_log_prob_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                hid_states_batch,
+                masks_batch,
+            ) = sample
+
+
+            # number of augmentations per sample
+            # we start with 1 and increase it if we use symmetry augmentation
+            num_aug = 1
+            # original batch size
+            # we assume policy group is always there and needs augmentation
+            original_batch_size = obs_batch.batch_size[0]
+
+            # check if we should normalize advantages per mini batch
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+
+            # Perform symmetric augmentation
+            if self.symmetry and self.symmetry["use_data_augmentation"]:
+                # augmentation using symmetry
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                # returned shape: [batch_size * num_aug, ...]
+                obs_batch, actions_batch = data_augmentation_func(
+                    obs=obs_batch,
+                    actions=actions_batch,
+                    env=self.symmetry["_env"],
+                )
+                # compute number of augmentations per sample
+                # we assume policy group is always there and needs augmentation
+                num_aug = int(obs_batch.batch_size[0] / original_batch_size)
+                # repeat the rest of the batch
+                # -- actor
+                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
+                # -- critic
+                target_values_batch = target_values_batch.repeat(num_aug, 1)
+                advantages_batch = advantages_batch.repeat(num_aug, 1)
+                returns_batch = returns_batch.repeat(num_aug, 1)
+
+            # Recompute actions log prob and entropy for current batch of transitions
+            # Note: we need to do this because we updated the policy with the new parameters
+            # -- actor
+            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+            # -- critic
+            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            # -- entropy
+            # we only keep the entropy of the first augmentation (the original one)
+            mu_batch = self.policy.action_mean[:original_batch_size]
+            sigma_batch = self.policy.action_std[:original_batch_size]
+            entropy_batch = self.policy.entropy[:original_batch_size]
+
+            # KL
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                with torch.inference_mode():
+                    kl = torch.sum(
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
+                        / (2.0 * torch.square(sigma_batch))
+                        - 0.5,
+                        axis=-1,
+                    )
+                    kl_mean = torch.mean(kl)
+
+                    # Reduce the KL divergence across all GPUs
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean /= self.gpu_world_size
+
+                    # Update the learning rate
+                    # Perform this adaptation only on the main process
+                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
+                    #       then the learning rate should be the same across all GPUs.
+                    if self.gpu_global_rank == 0:
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                    # Update the learning rate for all GPUs
+                    if self.is_multi_gpu:
+                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(lr_tensor, src=0)
+                        self.learning_rate = lr_tensor.item()
+
+                    # Update the learning rate for all parameter groups
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+
+            # Surrogate loss
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            # Value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Symmetry loss
+            if self.symmetry:
+                # obtain the symmetric actions
+                # if we did augmentation before then we don't need to augment again
+                if not self.symmetry["use_data_augmentation"]:
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
+                    # compute number of augmentations per sample
+                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+
+                # actions predicted by the actor for symmetrically-augmented observations
+                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+
+                # compute the symmetrically augmented actions
+                # note: we are assuming the first augmentation is the original one.
+                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
+                #   However, the symmetry loss is computed using the mean of the distribution.
+                action_mean_orig = mean_actions_batch[:original_batch_size]
+                _, actions_mean_symm_batch = data_augmentation_func(
+                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
+                )
+
+                # compute the loss (we skip the first augmentation as it is the original one)
+                mse_loss = torch.nn.MSELoss()
+                symmetry_loss = mse_loss(
+                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+                )
+                # add the loss to the total loss
+                if self.symmetry["use_mirror_loss"]:
+                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                else:
+                    symmetry_loss = symmetry_loss.detach()
+
+            # Random Network Distillation loss
+            # TODO: Move this processing to inside RND module.
+            if self.rnd:
+                # extract the rnd_state
+                # TODO: Check if we still need torch no grad. It is just an affine transformation.
+                with torch.no_grad():
+                    rnd_state_batch = self.rnd.get_rnd_state(obs_batch[:original_batch_size])
+                    rnd_state_batch = self.rnd.state_normalizer(rnd_state_batch)
+                # predict the embedding and the target
+                predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                target_embedding = self.rnd.target(rnd_state_batch).detach()
+                # compute the loss as the mean squared error
+                mseloss = torch.nn.MSELoss()
+                rnd_loss = mseloss(predicted_embedding, target_embedding)
+
+            # AMP loss
+            # TODO: Move this processing to inside AMP module.
+            with torch.no_grad():
+                num_amp_obs = self.amp_discriminator.num_amp_obs
+                num_amp_steps = self.amp_discriminator.num_amp_steps
+                B = amp_replay_batch.shape[0]
+                # reshape to (B, num_amp_steps, num_amp_obs)
+                amp_replay_rs = amp_replay_batch.view(B, num_amp_steps, num_amp_obs)
+                motion_data_rs = motion_data_batch.view(B, num_amp_steps, num_amp_obs)
+
+                # reshape to (B * num_amp_steps, num_amp_obs)
+                flat_replay = amp_replay_rs.reshape(-1, num_amp_obs)
+                flat_motion = motion_data_rs.reshape(-1, num_amp_obs)
+
+                flat_replay_norm = self.amp_discriminator.amp_obs_normalizer(flat_replay)
+                flat_motion_norm = self.amp_discriminator.amp_obs_normalizer(flat_motion)
+
+                # (B, num_amp_steps * num_amp_obs)
+                amp_replay_batch_normalized = flat_replay_norm.view(B, num_amp_steps * num_amp_obs)
+                motion_data_batch_normalized = flat_motion_norm.view(B, num_amp_steps * num_amp_obs)
+
+            policy_disc = self.amp_discriminator(amp_replay_batch_normalized)
+            expert_disc = self.amp_discriminator(motion_data_batch_normalized)
+            
+            policy_loss = torch.nn.MSELoss()(
+                policy_disc, -1 * torch.ones_like(policy_disc, device=self.device)
+            )
+            expert_loss = torch.nn.MSELoss()(
+                expert_disc, torch.ones_like(expert_disc, device=self.device)
+            )
+            disc_loss = 0.5 * (policy_loss + expert_loss)
+            grad_penalty_loss = self.amp_discriminator.compute_grad_pen(
+                motion_data_batch_normalized, scale=self.amp_cfg["grad_penalty_scale"]
+            )
+            
+            amp_loss = disc_loss + grad_penalty_loss
+
+            # Compute the gradients
+            # -- For PPO
+            self.optimizer.zero_grad()
+            loss.backward(retain_graph=True) # retain graph for AMP loss
+            # -- For RND
+            if self.rnd:
+                self.rnd_optimizer.zero_grad()  # type: ignore
+                rnd_loss.backward()
+            # -- For AMP
+            self.amp_optimizer.zero_grad()
+            amp_loss.backward()
+
+            # Collect gradients from all GPUs
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+
+            # Apply the gradients
+            # -- For PPO
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            # -- For RND
+            if self.rnd_optimizer:
+                self.rnd_optimizer.step()
+            # -- For AMP
+            self.amp_optimizer.step()
+            # update the AMP normalizer
+            self.amp_discriminator.update_normalization(amp_replay_batch[:, :num_amp_obs])
+            self.amp_discriminator.update_normalization(motion_data_batch[:, :num_amp_obs])
+
+            # Store the losses
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy_batch.mean().item()
+            # -- RND loss
+            if mean_rnd_loss is not None:
+                mean_rnd_loss += rnd_loss.item()
+            # -- Symmetry loss
+            if mean_symmetry_loss is not None:
+                mean_symmetry_loss += symmetry_loss.item()
+            # -- AMP loss
+            if mean_amp_loss is not None:
+                mean_amp_loss += amp_loss.item()
+                mean_grad_penalty_loss += grad_penalty_loss.item()
+                mean_policy_disc += policy_disc.mean().item()
+                mean_expert_disc += expert_disc.mean().item()
+
+        # -- For PPO
+        num_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_updates
+        mean_surrogate_loss /= num_updates
+        mean_entropy /= num_updates
+        # -- For RND
+        if mean_rnd_loss is not None:
+            mean_rnd_loss /= num_updates
+        # -- For Symmetry
+        if mean_symmetry_loss is not None:
+            mean_symmetry_loss /= num_updates
+        # -- For AMP
+        if mean_amp_loss is not None:
+            mean_amp_loss /= num_updates
+            mean_grad_penalty_loss /= num_updates
+            mean_policy_disc /= num_updates
+            mean_expert_disc /= num_updates
+        # -- Clear the storage
+        self.storage.clear()
+
+        # construct the loss dictionary
+        loss_dict = {
+            "value_function": mean_value_loss,
+            "surrogate": mean_surrogate_loss,
+            "entropy": mean_entropy,
+        }
+        if self.rnd:
+            loss_dict["rnd"] = mean_rnd_loss
+        if self.symmetry:
+            loss_dict["symmetry"] = mean_symmetry_loss
+        loss_dict["amp"] = mean_amp_loss
+        loss_dict["amp_grad_penalty"] = mean_grad_penalty_loss
+        loss_dict["amp_policy_disc"] = mean_policy_disc
+        loss_dict["amp_expert_disc"] = mean_expert_disc
+
+        return loss_dict
+
+        

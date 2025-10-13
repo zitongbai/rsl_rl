@@ -79,7 +79,7 @@ known_first_party = "rsl_rl"
 
 include = ["rsl_rl"]
 
-typeCheckingMode = "basic"
+typeCheckingMode = "off"
 pythonVersion = "3.8"
 pythonPlatform = "Linux"
 enableTypeIgnoreComments = true

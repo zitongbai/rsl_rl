@@ -116,7 +116,7 @@ class AMPRunner(OnPolicyRunner):
                         # For AMP: total and style rewards
                         amp_new_ids = new_ids if len(new_ids)>0 else slice(None)
                         style_rew_episode_mean = torch.mean(cur_style_reward_sum[amp_new_ids]) / (self.env.max_episode_length * self.env.unwrapped.step_dt)
-                        if len(amp_new_ids) > 0:
+                        if len(new_ids) > 0:
                             ep_infos[-1]["Episode_Reward/style"] = style_rew_episode_mean.item()
                         
                         total_rewbuffer.extend(cur_total_reward_sum[new_ids][:, 0].cpu().numpy().tolist())

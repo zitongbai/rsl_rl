@@ -294,12 +294,11 @@ class AMPRunner(OnPolicyRunner):
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-        torch.save(saved_dict, path)
-
         # Save AMP model
         saved_dict["amp_discriminator_state_dict"] = self.alg.amp_discriminator.state_dict()
         saved_dict["amp_discriminator_normalizer_state_dict"] = self.alg.amp_discriminator.disc_obs_normalizer.state_dict()
         saved_dict["amp_discriminator_optimizer_state_dict"] = self.alg.disc_optimizer.state_dict()
+        torch.save(saved_dict, path)
 
         # Upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:

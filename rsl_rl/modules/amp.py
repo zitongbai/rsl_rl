@@ -4,10 +4,17 @@ import torch
 import torch.nn as nn
 from torch import autograd
 from tensordict import TensorDict
+from enum import Enum
 
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import resolve_nn_activation
 from rsl_rl.networks import EmpiricalNormalization
+
+
+class LossType(Enum):
+    GAN = 0
+    LSGAN = 1
+    WGAN = 2
 
 
 class AMPDiscriminator(nn.Module):
@@ -15,6 +22,7 @@ class AMPDiscriminator(nn.Module):
             disc_obs_dim: int,
             disc_obs_steps: int,
             obs_groups: dict,
+            loss_type: LossType = LossType.LSGAN,
             hidden_dims = [256, 256, 256],
             activation="relu",
             style_reward_scale=1.0, 
@@ -31,6 +39,8 @@ class AMPDiscriminator(nn.Module):
         assert style_reward_scale >= 0, "AMP reward scale must be non-negative."
         self.style_reward_scale = style_reward_scale
         self.task_style_lerp = task_style_lerp
+        self.device = device
+        self.loss_type = loss_type
         
         # Discriminator observation normalizer
         self.disc_obs_normalizer = EmpiricalNormalization(shape=self.disc_obs_dim, until=1e8).to(device)
@@ -47,6 +57,11 @@ class AMPDiscriminator(nn.Module):
         
         print(f"AMP Discriminator MLP: {self.disc_trunk}")
         print(f"AMP Discriminator Output Layer: {self.disc_linear}")
+        
+        if self.loss_type == LossType.WGAN:
+            self.disc_output_normalizer = EmpiricalNormalization(shape=1, until=1e8).to(device)
+        else: 
+            self.disc_output_normalizer = torch.nn.Identity()
 
     def forward(self, x)-> torch.Tensor:
         """Forward pass for the AMP Discriminator.
@@ -162,11 +177,24 @@ class AMPDiscriminator(nn.Module):
             normed_disc_obs = normed_disc_obs.view(-1, self.disc_obs_steps * self.disc_obs_dim)  # [num_envs, disc_obs_steps * disc_obs_dim]
         
             disc_score = self.forward(normed_disc_obs)  # [num_envs, 1]
-            # TODO: different formulations of AMP reward
-            style_reward = dt * self.style_reward_scale * torch.clamp(1 - (1/4) * torch.square(disc_score - 1), min=0) # [num_envs, 1]
+            
+            rew = 0
+            if self.loss_type == LossType.GAN:
+                prob = 1.0 / (1.0 + torch.exp(-disc_score))
+                rew = - torch.log(torch.maximum(1-prob, torch.tensor(1e-6, device=self.device)))  # [num_envs, 1]
+            elif self.loss_type == LossType.LSGAN:
+                rew =  torch.clamp(1 - (1/4) * torch.square(disc_score - 1), min=0) # [num_envs, 1]
+            elif self.loss_type == LossType.WGAN:
+                rew = self.disc_output_normalizer(disc_score) # [num_envs, 1]
+            else: 
+                raise ValueError(f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'")
+            
+            style_reward = dt * self.style_reward_scale * rew
             
             if was_training:
                 self.train()
+                if self.loss_type == LossType.WGAN:
+                    self.disc_output_normalizer.update(disc_score)
             
         return style_reward.squeeze(-1), disc_score.squeeze(-1)
     

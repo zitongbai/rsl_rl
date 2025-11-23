@@ -11,6 +11,7 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, CircularBuffer
 from rsl_rl.utils import string_to_callable
 from rsl_rl.algorithms import PPO
+from rsl_rl.modules.amp import LossType
 
 
 class PPOAMP(PPO):
@@ -68,10 +69,20 @@ class PPOAMP(PPO):
         if self.amp_cfg is None:
             raise ValueError("AMP configuration must be provided for PPOAMP algorithm.")
         
+        if self.amp_cfg["loss_type"] == "GAN":
+            self.loss_type = LossType.GAN
+        elif self.amp_cfg["loss_type"] == "LSGAN":
+            self.loss_type = LossType.LSGAN
+        elif self.amp_cfg["loss_type"] == "WGAN":
+            self.loss_type = LossType.WGAN
+        else:
+            raise ValueError(f"Unknown AMP loss type: {self.amp_cfg['loss_type']}. Should be 'GAN', 'LSGAN', or 'WGAN'")
+        
         self.amp_discriminator: AMPDiscriminator = AMPDiscriminator(
             disc_obs_dim=self.amp_cfg["disc_obs_dim"],
             disc_obs_steps=self.amp_cfg["disc_obs_steps"],
             obs_groups=self.policy.obs_groups,
+            loss_type=self.loss_type,
             device=device,
             **self.amp_cfg.get("amp_discriminator", {})
         ).to(self.device)
@@ -338,13 +349,28 @@ class PPOAMP(PPO):
             disc_score = self.amp_discriminator(disc_obs_batch_normed.reshape(mini_batch_size, -1))  # [mini_batch_size, 1]
             disc_demo_score = self.amp_discriminator(disc_demo_obs_batch_normed.reshape(mini_batch_size, -1))  # [mini_batch_size, 1]
             
-            policy_loss = torch.nn.MSELoss()(
-                disc_score, -1 * torch.ones_like(disc_score, device=self.device)
-            )
-            demo_loss = torch.nn.MSELoss()(
-                disc_demo_score, torch.ones_like(disc_demo_score, device=self.device)
-            )
-            disc_loss = 0.5 * (policy_loss + demo_loss)
+            if self.loss_type == LossType.GAN:
+                bce = torch.nn.BCEWithLogitsLoss()
+                policy_loss = bce(
+                    disc_score, torch.zeros_like(disc_score, device=self.device)
+                )
+                demo_loss = bce(
+                    disc_demo_score, torch.ones_like(disc_demo_score, device=self.device)
+                )
+                disc_loss = 0.5 * (policy_loss + demo_loss)
+            elif self.loss_type == LossType.LSGAN:
+                policy_loss = torch.nn.MSELoss()(
+                    disc_score, -1 * torch.ones_like(disc_score, device=self.device)
+                )
+                demo_loss = torch.nn.MSELoss()(
+                    disc_demo_score, torch.ones_like(disc_demo_score, device=self.device)
+                )
+                disc_loss = 0.5 * (policy_loss + demo_loss)
+            elif self.loss_type == LossType.WGAN:
+                disc_loss = - torch.mean(disc_demo_score) + torch.mean(disc_score)
+            else: 
+                raise ValueError(f"Unknown AMP loss type: {self.loss_type}. Should be 'GAN', 'LSGAN', or 'WGAN'")
+
             disc_grad_penalty = self.amp_discriminator.compute_grad_penalty(
                 demo_data=disc_demo_obs_batch_normed.reshape(mini_batch_size, -1),
                 scale=self.amp_cfg["grad_penalty_scale"]

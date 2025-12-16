@@ -6,7 +6,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, AMPDiscriminator
+from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent, AMPDiscriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, CircularBuffer
 from rsl_rl.utils import string_to_callable
@@ -16,12 +16,15 @@ from rsl_rl.modules.amp import LossType
 
 class PPOAMP(PPO):
 
-    policy: ActorCritic | ActorCriticRecurrent
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN,
+        storage: RolloutStorage,
+        disc_obs_buffer: CircularBuffer, 
+        disc_demo_obs_buffer: CircularBuffer,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -34,8 +37,8 @@ class PPOAMP(PPO):
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
-        device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
+        device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -47,6 +50,7 @@ class PPOAMP(PPO):
     ) -> None:
         super().__init__(
             policy,
+            storage,
             num_learning_epochs,
             num_mini_batches,
             clip_param,
@@ -59,12 +63,13 @@ class PPOAMP(PPO):
             use_clipped_value_loss,
             schedule,
             desired_kl,
-            device,
             normalize_advantage_per_mini_batch,
+            device,
             rnd_cfg,
             symmetry_cfg,
             multi_gpu_cfg,
         )
+        
         self.amp_cfg = amp_cfg
         if self.amp_cfg is None:
             raise ValueError("AMP configuration must be provided for PPOAMP algorithm.")
@@ -108,35 +113,8 @@ class PPOAMP(PPO):
         self.disc_max_grad_norm = self.amp_cfg.get("disc_max_grad_norm", 0.5)
         
         # Storage for AMP discriminator observations
-        self.disc_obs_buffer: CircularBuffer = None
-        self.disc_demo_obs_buffer: CircularBuffer = None
-        
-    def init_storage(
-        self,
-        training_type: str,
-        num_envs: int,
-        num_transitions_per_env: int,
-        obs: TensorDict,
-        actions_shape: tuple[int] | list[int],
-    ) -> None:
-        super().init_storage(
-            training_type,
-            num_envs,
-            num_transitions_per_env,
-            obs,
-            actions_shape,
-        )
-        # initialize AMP discriminator observation buffers
-        self.disc_obs_buffer = CircularBuffer(
-            max_len=self.amp_cfg["disc_obs_buffer_size"],
-            batch_size=num_envs,
-            device=self.device,
-        )
-        self.disc_demo_obs_buffer = CircularBuffer(
-            max_len=self.amp_cfg["disc_obs_buffer_size"],
-            batch_size=num_envs,
-            device=self.device,
-        )
+        self.disc_obs_buffer: CircularBuffer = disc_obs_buffer
+        self.disc_demo_obs_buffer: CircularBuffer = disc_demo_obs_buffer
         
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -438,7 +416,7 @@ class PPOAMP(PPO):
 
         # Construct the loss dictionary
         loss_dict = {
-            "value_function": mean_value_loss,
+            "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }

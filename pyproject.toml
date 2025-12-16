@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rsl-rl-lib"
-version = "3.1.3"
+version = "3.2.0"
 keywords = ["reinforcement-learning", "robotics"]
 maintainers = [
   { name="Clemens Schwarke", email="cschwarke@ethz.ch" },
@@ -56,5 +56,5 @@ reportMissingImports = "none"
 # This is required to ignore type checks of modules with stubs missing.
 reportMissingModuleSource = "none"  # -> most common: prettytable in mdp managers
 reportGeneralTypeIssues = "none"  # -> usage of literal MISSING in dataclasses
-reportOptionalMemberAccess = "warning"
+reportOptionalMemberAccess = "none"
 reportPrivateUsage = "warning"

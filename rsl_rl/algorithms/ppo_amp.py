@@ -121,6 +121,12 @@ class PPOAMP(PPO):
     ) -> None:
         disc_obs = self.amp_discriminator.get_disc_obs(obs, flatten_history_dim=False)
         disc_demo_obs = self.amp_discriminator.get_disc_demo_obs(obs, flatten_history_dim=False)
+        if "terminal_obs" in extras:
+            terminal_disc_obs = self.amp_discriminator.get_disc_obs(extras["terminal_obs"], flatten_history_dim=False)
+            done_mask = dones.to(dtype=torch.bool)
+            if torch.any(done_mask):
+                disc_obs = disc_obs.clone()
+                disc_obs[done_mask] = terminal_disc_obs[done_mask]
         # Compute the Style Reward
         self.style_rewards, self.disc_score = self.amp_discriminator.predict_style_reward(disc_obs, dt=self.amp_cfg["step_dt"])
         # Linearly interpolate between task reward and style reward

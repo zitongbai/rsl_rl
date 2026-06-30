@@ -111,6 +111,7 @@ class PPOAMP(PPO):
             lr=self.amp_cfg["disc_learning_rate"],
         )
         self.disc_max_grad_norm = self.amp_cfg.get("disc_max_grad_norm", 0.5)
+        self.disc_update_interval = self.amp_cfg.get("disc_update_interval", 1)
         
         # Storage for AMP discriminator observations
         self.disc_obs_buffer: CircularBuffer = disc_obs_buffer
@@ -169,6 +170,8 @@ class PPOAMP(PPO):
         )
 
         # Iterate over batches
+        mini_batch_idx = 0
+        disc_updates_done = 0
         for samples, disc_obs_batch, disc_demo_obs_batch in zip(generator, disc_obs_generator, disc_demo_obs_generator):
             (
                 obs_batch,
@@ -361,6 +364,9 @@ class PPOAMP(PPO):
             )
             disc_total_loss = disc_loss + disc_grad_penalty
 
+            # Whether to update the discriminator this mini-batch step
+            do_disc_update = (mini_batch_idx % self.disc_update_interval == 0)
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -368,9 +374,10 @@ class PPOAMP(PPO):
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
-            # Compute the gradients for AMP discriminator
-            self.disc_optimizer.zero_grad()
-            disc_total_loss.backward()
+            # Compute the gradients for AMP discriminator (conditional)
+            if do_disc_update:
+                self.disc_optimizer.zero_grad()
+                disc_total_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -382,10 +389,10 @@ class PPOAMP(PPO):
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
-            # Apply the gradients for AMP discriminator
-            self.disc_optimizer.step()
-            # Update the AMP normalizer
-            self.amp_discriminator.update_normalization(disc_obs_batch)
+            # Apply the gradients for AMP discriminator (conditional)
+            if do_disc_update:
+                self.disc_optimizer.step()
+                self.amp_discriminator.update_normalization(disc_obs_batch)
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -397,11 +404,15 @@ class PPOAMP(PPO):
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            # AMP discriminator loss and other info
-            mean_disc_loss += disc_loss.item()
-            mean_disc_grad_penalty += disc_grad_penalty.item()
+            # AMP: scores logged every step (saturation tracking); losses only when updating
             mean_disc_score += disc_score.mean().item()
             mean_disc_demo_score += disc_demo_score.mean().item()
+            if do_disc_update:
+                mean_disc_loss += disc_loss.item()
+                mean_disc_grad_penalty += disc_grad_penalty.item()
+                disc_updates_done += 1
+
+            mini_batch_idx += 1
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -412,10 +423,12 @@ class PPOAMP(PPO):
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        mean_disc_loss /= num_updates
-        mean_disc_grad_penalty /= num_updates
+        # disc scores are accumulated every step; losses only on actual update steps
         mean_disc_score /= num_updates
         mean_disc_demo_score /= num_updates
+        if disc_updates_done > 0:
+            mean_disc_loss /= disc_updates_done
+            mean_disc_grad_penalty /= disc_updates_done
 
         # Clear the storage
         self.storage.clear()

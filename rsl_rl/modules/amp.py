@@ -133,20 +133,11 @@ class AMPDiscriminator(nn.Module):
         disc_obs_reshaped = disc_obs.reshape(-1, self.disc_obs_dim)  # [num_envs * disc_obs_steps, disc_obs_dim]
         self.disc_obs_normalizer.update(disc_obs_reshaped)
 
-    def compute_grad_penalty(self, demo_data: torch.Tensor, policy_data: torch.Tensor | None = None, scale=10):
+    def compute_grad_penalty(self, demo_data: torch.Tensor, scale=10):
         """Compute the gradient penalty for the AMP Discriminator.
-
-        When policy_data is provided, the penalty is computed on the concatenation of demo and
-        policy data (real + fake). This constrains the discriminator to have near-zero gradients
-        near both the real data manifold and the policy's output distribution, preventing the
-        discriminator from becoming overconfident in either region and thus slowing saturation.
-
-        When policy_data is None, the penalty is applied to demo data only (original R1 behaviour).
 
         Args:
             demo_data (torch.Tensor): Demonstration data. Shape: (num_samples, disc_obs_dim * disc_obs_steps).
-            policy_data (torch.Tensor | None): Policy/fake data with the same shape as demo_data.
-                If provided, penalty is computed on concat(demo, policy). Defaults to None.
             scale (int, optional): Weight for the gradient penalty. Defaults to 10.
 
         Returns:
@@ -154,18 +145,12 @@ class AMPDiscriminator(nn.Module):
         """
         assert len(demo_data.shape) == 2, "Demonstration data must be a 2D tensor (num_samples, disc_obs_dim * disc_obs_steps)."
 
-        if policy_data is not None:
-            assert len(policy_data.shape) == 2, "Policy data must be a 2D tensor (num_samples, disc_obs_dim * disc_obs_steps)."
-            combined = torch.cat([demo_data, policy_data], dim=0)
-        else:
-            combined = demo_data
+        demo_data_copy = demo_data.clone().detach().requires_grad_(True)
 
-        combined_copy = combined.clone().detach().requires_grad_(True)
-
-        disc = self.forward(combined_copy)
-        ones = torch.ones_like(disc, device=combined_copy.device)
+        disc = self.forward(demo_data_copy)
+        ones = torch.ones_like(disc, device=demo_data_copy.device)
         grad = autograd.grad(
-            outputs=disc, inputs=combined_copy,
+            outputs=disc, inputs=demo_data_copy,
             grad_outputs=ones, create_graph=True,
             retain_graph=True, only_inputs=True)[0]
 

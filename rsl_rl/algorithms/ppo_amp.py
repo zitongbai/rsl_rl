@@ -357,6 +357,7 @@ class PPOAMP(PPO):
 
             disc_grad_penalty = self.amp_discriminator.compute_grad_penalty(
                 demo_data=disc_demo_obs_batch_normed.reshape(mini_batch_size, -1),
+                policy_data=disc_obs_batch_normed.reshape(mini_batch_size, -1),
                 scale=self.amp_cfg["grad_penalty_scale"]
             )
             disc_total_loss = disc_loss + disc_grad_penalty
